@@ -1,39 +1,80 @@
-# ui.py — 安全起動版（遅延インポート＋白画面回避）/ Shared PersistentClient / 参照折りたたみ対応
+# ui.py — 白画面完全回避版（超安全起動）/ Shared PersistentClient / 参照折りたたみ
 import os, io, base64, re, sys, subprocess, logging, traceback, time
 from uuid import uuid4
 from typing import Optional
 
 import streamlit as st
-from PIL import Image
-
-import config
-from apisecret import catch_errors
+st.set_page_config(page_title="ココさんのお悩み相談室", page_icon="🤖", layout="centered")
+logger = logging.getLogger("streamlit")
 
 # ─────────────────────────────────────────────────────────────
-# PersistentClient共有ヘルパー（utilis/chroma_client が無くても安全に動作）
+# まずは “画面を出すために必要最小限” だけ読み込む。以降は安全にロード。
+# ─────────────────────────────────────────────────────────────
+def _fatal_panel(title: str, err: Exception, tb: str):
+    st.error(f"{title}: {type(err).__name__}: {err}")
+    with st.expander("スタックトレース（クリックで開く）", expanded=False):
+        st.code(tb)
+    st.stop()
+
+# 画像系は無くても動くようにする
+try:
+    from PIL import Image
+except Exception as e:
+    Image = None  # 画像は後でスキップ
+
+# `config` は無いと先に進めないので “可視化して止める”
+try:
+    import config
+except Exception as e:
+    _fatal_panel("config の読み込みでエラー", e, traceback.format_exc())
+
+# `apisecret` は無い場合に備えてフォールバックを用意
+try:
+    from apisecret import catch_errors
+except Exception:
+    def catch_errors():
+        def _wrap(fn):
+            def _in(*a, **kw):
+                try:
+                    return fn(*a, **kw)
+                except Exception:
+                    st.error("実行時エラーが発生しました。ログを確認してください。")
+                    st.code(traceback.format_exc())
+                    raise
+            return _in
+        return _wrap
+
+# ─────────────────────────────────────────────────────────────
+# PersistentClient 共有（utilis/chroma_client が無くても動くフォールバック）
 # ─────────────────────────────────────────────────────────────
 try:
-    from utilis.chroma_client import get_client  # 推奨：共通クライアント
+    from utilis.chroma_client import get_client  # 推奨の共通クライアント
 except Exception:
     def get_client(persist_dir: Optional[str] = None):
-        from chromadb import PersistentClient
+        try:
+            from chromadb import PersistentClient
+        except Exception as e:
+            _fatal_panel("Chroma の読み込みでエラー", e, traceback.format_exc())
         persist_dir = persist_dir or os.getenv("VECTOR_PERSIST_DIR", "data/chroma")
         if not hasattr(get_client, "_cache"):
             get_client._cache = {}
         cli = get_client._cache.get(persist_dir)
         if cli is None:
-            cli = PersistentClient(path=persist_dir)  # Settingsは渡さない（全箇所同一）
+            cli = PersistentClient(path=persist_dir)  # Settings は渡さない（全箇所同一）
             get_client._cache[persist_dir] = cli
         return cli
 
 # ─────────────────────────────────────────────────────────────
-# 安全な遅延インポート（失敗しても画面を出す）
+# Router / Web連携など “重い依存” は遅延インポートして可視化
 # ─────────────────────────────────────────────────────────────
 def _safe_imports():
     try:
         from utilis.router_utils import init_router_components, route_answer
         from utilis.memory_utils import reset_session_history
-        from utilis.web_live_chain import make_web_chain
+        try:
+            from utilis.web_live_chain import make_web_chain
+        except Exception:
+            make_web_chain = None  # Web無しでも動く
         return {"ok": True,
                 "init_router_components": init_router_components,
                 "route_answer": route_answer,
@@ -44,58 +85,33 @@ def _safe_imports():
 
 imports = _safe_imports()
 
-# ─────────────────────────────────────────────────────────────
-# ページ設定・ロガー
-# ─────────────────────────────────────────────────────────────
-st.set_page_config(page_title="ココさんのお悩み相談室", page_icon="🤖", layout="centered")
-logger = logging.getLogger("streamlit")
-
-# ===== CSS =====
+# ===== CSS（軽量） =====
 st.markdown("""
 <style>
 [data-testid="stAppViewContainer"] { background:#fff; }
 .block-container {
-  max-width: 720px;
-  margin-left: auto;
-  margin-right: auto;
-  border:4px solid #15b15b;
-  border-radius:20px;
-  padding:12px 14px !important;
+  max-width: 720px; margin: 0 auto;
+  border:4px solid #15b15b; border-radius:20px; padding:12px 14px !important;
 }
-.stChatMessage { margin-top: 10px; margin-bottom: 10px; }
+.stChatMessage { margin: 10px 0; }
 .assistant-bubble {
-  background:#15b15b; color:#fff;
-  padding:.6rem .9rem; border-radius:16px;
-  display:inline-block; max-width:86%;
-  line-height: 1.7; max-width: 38rem;
+  background:#15b15b; color:#fff; padding:.6rem .9rem; border-radius:16px;
+  display:inline-block; max-width:38rem; line-height:1.7;
 }
-.assistant-bubble p { margin: .6rem 0; }
 .hero-wrap { display:flex; justify-content:center; margin:8px 0 6px; }
 .hero-img  { width:132px; height:132px; object-fit:cover; border-radius:50%; }
 h1 { text-align:center !important; font-weight:800; margin:.4rem 0 .6rem; }
-[data-testid="stCaptionContainer"] { margin-top: .1rem; margin-bottom: .8rem; }
-@media (max-width: 480px) {
-  .hero-img { width:112px; height:112px; }
-  h1 { font-size:22px !important; line-height:1.2; white-space:nowrap; }
-  .assistant-bubble { max-width: 32rem; }
-}
-@media (min-width: 481px) {
-  h1 { font-size:36px !important; line-height:1.2; }
-}
-footer { margin-bottom: 12px; }
+@media (max-width: 480px) { .hero-img { width:112px; height:112px; } h1 { font-size:22px !important; } }
 </style>
 """, unsafe_allow_html=True)
 
-# ===== 画面ヘッダー（タイトル先に描画） =====
+# ===== タイトルは “必ず” ここまでに出す =====
 st.title("ココさんのお悩み相談室")
 st.caption("なんでも相談してね。ルータでカテゴリ分岐 & RAG つき。")
 
-# ===== 遅延インポートの結果をここで検査（白画面回避） =====
+# ===== 遅延インポート失敗を可視化（白画面回避の要） =====
 if not imports["ok"]:
-    st.error(f"モジュールの読み込みでエラー: {type(imports['err']).__name__}: {imports['err']}")
-    with st.expander("スタックトレース（クリックで開く）", expanded=False):
-        st.code(imports["tb"])
-    st.stop()
+    _fatal_panel("モジュールの読み込みでエラー", imports["err"], imports["tb"])
 
 # 以降は安全に参照
 init_router_components = imports["init_router_components"]
@@ -103,34 +119,29 @@ route_answer = imports["route_answer"]
 reset_session_history = imports["reset_session_history"]
 make_web_chain = imports["make_web_chain"]
 
-# ===== Chroma 診断 =====
+# ===== Chroma 診断（共有 PersistentClient 利用） =====
 with st.sidebar.expander("🔍 Chroma診断", expanded=False):
-    import traceback
     persist_dir = os.getenv("VECTOR_PERSIST_DIR", "data/chroma")
     collection  = os.getenv("VECTOR_COLLECTION", "kokosan")
     st.caption(f"dir: `{persist_dir}` / collection: `{collection}`")
     try:
         client = get_client(persist_dir)
         coll = client.get_or_create_collection(collection)
-        cnt = coll.count()
         st.success(f"✅ Collection: {coll.name}")
-        st.write("📄 Docs:", cnt)
+        st.write("📄 Docs:", coll.count())
     except Exception as e:
         st.error(f"❌ {type(e).__name__}: {e}")
-        st.code("".join(traceback.format_exc()), language="text")
-
+        st.code(traceback.format_exc())
     with st.expander("詳細診断（コレクション一覧/メタ）", expanded=False):
         try:
-            client = get_client(persist_dir)
-            cols = client.list_collections()
+            cols = get_client(persist_dir).list_collections()
             st.write("collections:", [c.name for c in cols])
             try:
-                coll = client.get_or_create_collection(collection)
-                got = coll.get(include=["metadatas"], limit=3)
+                got = get_client(persist_dir).get_or_create_collection(collection).get(include=["metadatas"], limit=3)
                 st.write("sample metadatas:", got.get("metadatas", []) )
             except Exception as e2:
                 st.warning(f"meta read error: {e2}")
-                st.code("".join(traceback.format_exc()), language="text")
+                st.code(traceback.format_exc())
         except Exception as e0:
             st.warning(f"list_collections error: {e0}")
 
@@ -147,23 +158,18 @@ with st.sidebar:
         ]
         try:
             with st.spinner("ベクトルDBを作成中…"):
-                result = subprocess.run(
-                    cmd, check=True, capture_output=True, text=True, cwd=os.getcwd()
-                )
+                result = subprocess.run(cmd, check=True, capture_output=True, text=True, cwd=os.getcwd())
                 logger.info("[INGEST][STDOUT]\n%s", result.stdout)
-                if result.stderr:
-                    logger.info("[INGEST][STDERR]\n%s", result.stderr)
-            # ingest直後の再初期化（ロック/未反映対策）
+                if result.stderr: logger.info("[INGEST][STDERR]\n%s", result.stderr)
             time.sleep(0.5)
             try:
-                client = get_client(config.VECTOR_PERSIST_DIR)
-                coll = client.get_or_create_collection(config.VECTOR_COLLECTION)
+                coll = get_client(config.VECTOR_PERSIST_DIR).get_or_create_collection(config.VECTOR_COLLECTION)
                 _ = coll.count()
                 st.success("ingest 完了 & 再初期化OK。再読み込みします。")
                 st.rerun()
             except Exception as e:
                 st.error(f"ingest後の再初期化エラー: {type(e).__name__}: {e}")
-                st.code("".join(traceback.format_exc()), language="text")
+                st.code(traceback.format_exc())
         except subprocess.CalledProcessError as e:
             st.error(f"ingestでエラー: {e.returncode}")
             logger.exception("[INGEST][ERROR] %s", e.stderr or e.stdout)
@@ -178,43 +184,42 @@ with st.sidebar.expander("🧹 クリーン再構築", expanded=False):
             st.info("既存DBを削除しました。続けて ingest を実行してください。")
         except Exception as e:
             st.error(f"削除でエラー: {e}")
-            st.code("".join(traceback.format_exc()), language="text")
+            st.code(traceback.format_exc())
 
-# ===== 画像ユーティリティ =====
+# ===== 画像ユーティリティ（Pillow無くても動く） =====
 @st.cache_data(show_spinner=False)
-def load_image(path: str) -> Image.Image:
-    return Image.open(path).convert("RGBA")
+def load_image(path: str):
+    if Image is None or not os.path.exists(path):
+        return None
+    try:
+        return Image.open(path).convert("RGBA")
+    except Exception:
+        return None
 
-def to_b64(img: Image.Image) -> str:
+def to_b64(img):
     buf = io.BytesIO(); img.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 AVATAR_PATH = os.path.join("assets", "coco_264.png")
-
-# ===== セッション初期化 =====
-ss = st.session_state
-if "router_bundle" not in ss:
-    ss.router_bundle = init_router_components()
-if "messages" not in ss:
-    ss.messages = []
-if "debug" not in ss:
-    ss.debug = False
-if "session_id" not in ss:
-    ss.session_id = str(uuid4())
-router, dest_chains, default_chain, retriever = ss.router_bundle
-
-# ===== アバター（任意） =====
-if os.path.exists(AVATAR_PATH):
+img = load_image(AVATAR_PATH)
+if img is not None:
     try:
-        img_b64 = to_b64(load_image(AVATAR_PATH))
         st.markdown(
             f"""<div class="hero-wrap">
-                   <img class="hero-img" src="data:image/png;base64,{img_b64}" alt="bot avatar"/>
+                   <img class="hero-img" src="data:image/png;base64,{to_b64(img)}" alt="bot avatar"/>
                 </div>""",
             unsafe_allow_html=True
         )
     except Exception:
-        pass  # 画像が壊れていてもUIは落とさない
+        pass
+
+# ===== セッション初期化 =====
+ss = st.session_state
+if "router_bundle" not in ss: ss.router_bundle = init_router_components()
+if "messages" not in ss:      ss.messages = []
+if "debug" not in ss:         ss.debug = False
+if "session_id" not in ss:    ss.session_id = str(uuid4())
+router, dest_chains, default_chain, retriever = ss.router_bundle
 
 # ===== 操作ヘッダー =====
 left, right = st.columns([1,1])
@@ -229,14 +234,9 @@ with right:
     ss.debug = st.toggle("デバッグ表示", value=ss.debug)
 
 # ===== 入力エリア =====
-if "is_sending" not in ss:
-    ss.is_sending = False
-
+if "is_sending" not in ss: ss.is_sending = False
 if "web_chain" not in ss:
-    try:
-        ss.web_chain = make_web_chain()
-    except Exception:
-        ss.web_chain = None
+    ss.web_chain = imports["make_web_chain"]() if imports["make_web_chain"] else None
 
 use_live_web = st.sidebar.toggle("リアルタイムWeb検索（カテゴリ⑦）", value=True)
 
@@ -256,10 +256,11 @@ def handle_user_input(user_text: str):
         ss.messages.append({"role": "assistant", "content": answer})
         ss.is_sending = False
         return True
-    except Exception as e:
+    except Exception:
         ss.is_sending = False
         st.toast("エラーが発生しました", icon="⚠️")
-        raise e
+        st.code(traceback.format_exc())
+        raise
 
 text = st.chat_input("なんでも相談してね", disabled=ss.is_sending)
 if text:
@@ -269,17 +270,15 @@ if text:
 # ===== メッセージ描画（参考の折りたたみ） =====
 def split_body_and_refs(text: str):
     s = text.strip()
-    body = s
-    refs = []
+    body = s; refs = []
     m = re.search(r"\n+#\s*参照資料\s*\n(.+)$", s, flags=re.S)
     if m:
         body = s[:m.start()].rstrip()
-        refs_block = m.group(1).strip()
-        lines = [ln.strip() for ln in refs_block.splitlines() if ln.strip()]
+        lines = [ln.strip() for ln in m.group(1).strip().splitlines() if ln.strip()]
         refs = [ln[2:].strip() if ln.startswith("- ") else ln for ln in lines]
     return body, refs
 
-assistant_avatar_path = AVATAR_PATH if os.path.exists(AVATAR_PATH) else None
+assistant_avatar_path = AVATAR_PATH if img is not None else None
 for msg in ss.messages:
     role = msg["role"]
     body, refs = split_body_and_refs(msg["content"]) if role == "assistant" else (msg["content"], [])
