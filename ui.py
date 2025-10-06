@@ -1,17 +1,13 @@
-# utilis/retriever_utils.py — Shared PersistentClient / Chroma 安定化版
-from __future__ import annotations
-from typing import List, Tuple, Optional, Dict, Any
-import os
-from collections import Counter
-from pathlib import Path
+# ui.py — 安全起動版（遅延インポート＋白画面回避）/ Shared PersistentClient / 参照折りたたみ対応
+import os, io, base64, re, sys, subprocess, logging, traceback, time
+from uuid import uuid4
+from typing import Optional
 
-from langchain_chroma import Chroma
-from langchain_openai import OpenAIEmbeddings
-from langchain_core.runnables import RunnableLambda
-from langchain_core.documents import Document
+import streamlit as st
+from PIL import Image
 
-from apisecret import get_secret
-from config import VECTOR_PERSIST_DIR, VECTOR_COLLECTION, EMBED_MODEL, CATEGORY_CHAT_ONLY
+import config
+from apisecret import catch_errors
 
 # ─────────────────────────────────────────────────────────────
 # PersistentClient共有ヘルパー（utilis/chroma_client が無くても安全に動作）
@@ -19,260 +15,280 @@ from config import VECTOR_PERSIST_DIR, VECTOR_COLLECTION, EMBED_MODEL, CATEGORY_
 try:
     from utilis.chroma_client import get_client  # 推奨：共通クライアント
 except Exception:
-    _client_cache: Dict[str, Any] = {}
     def get_client(persist_dir: Optional[str] = None):
         from chromadb import PersistentClient
         persist_dir = persist_dir or os.getenv("VECTOR_PERSIST_DIR", "data/chroma")
-        cli = _client_cache.get(persist_dir)
+        if not hasattr(get_client, "_cache"):
+            get_client._cache = {}
+        cli = get_client._cache.get(persist_dir)
         if cli is None:
             cli = PersistentClient(path=persist_dir)  # Settingsは渡さない（全箇所同一）
-            _client_cache[persist_dir] = cli
+            get_client._cache[persist_dir] = cli
         return cli
 
-# -----------------------------
-# 1) VectorStore 初期化（共有Client）
-# -----------------------------
-def init_chroma_vectorstore(
-    persist_dir: str = VECTOR_PERSIST_DIR,
-    collection: str = VECTOR_COLLECTION,
-    embedding_model: str = EMBED_MODEL,
-):
-    emb = OpenAIEmbeddings(model=embedding_model, api_key=get_secret("OPENAI_API_KEY"))
-    client = get_client(persist_dir)  # ★ UI と同一インスタンスを共有
-    vs = Chroma(
-        collection_name=collection,
-        embedding_function=emb,
-        client=client,                 # ← persist_directory や client_settings は渡さない
-    )
-    return vs
+# ─────────────────────────────────────────────────────────────
+# 安全な遅延インポート（失敗しても画面を出す）
+# ─────────────────────────────────────────────────────────────
+def _safe_imports():
+    try:
+        from utilis.router_utils import init_router_components, route_answer
+        from utilis.memory_utils import reset_session_history
+        from utilis.web_live_chain import make_web_chain
+        return {"ok": True,
+                "init_router_components": init_router_components,
+                "route_answer": route_answer,
+                "reset_session_history": reset_session_history,
+                "make_web_chain": make_web_chain}
+    except Exception as e:
+        return {"ok": False, "err": e, "tb": traceback.format_exc()}
 
-# ---------------------------------
-# 2) Retriever 初期化（MMR/類似度の切替）
-# ---------------------------------
-def init_retriever(
-    persist_dir: str = VECTOR_PERSIST_DIR,
-    collection: str = VECTOR_COLLECTION,
-    embedding_model: str = EMBED_MODEL,
-    k: int = 5,
-    fetch_k: int = 20,
-    use_mmr: bool = True,
-    score_threshold: Optional[float] = None,
-    filter_category: Optional[str] = None,
-):
-    vs = init_chroma_vectorstore(persist_dir, collection, embedding_model)
-    filter_kw = {"filter": {"category": filter_category}} if filter_category else {}
+imports = _safe_imports()
 
-    if use_mmr:
-        # ✅ MMR：fetch_k は使う。threshold は渡さない
-        return vs.as_retriever(
-            search_type="mmr",
-            search_kwargs={"k": k, "fetch_k": max(fetch_k or 0, k), **filter_kw},
-        )
+# ─────────────────────────────────────────────────────────────
+# ページ設定・ロガー
+# ─────────────────────────────────────────────────────────────
+st.set_page_config(page_title="ココさんのお悩み相談室", page_icon="🤖", layout="centered")
+logger = logging.getLogger("streamlit")
 
-    if score_threshold is None:
-        # ✅ similarity：しきい値なし（k と filter だけ）
-        return vs.as_retriever(
-            search_type="similarity",
-            search_kwargs={"k": k, **filter_kw},
-        )
+# ===== CSS =====
+st.markdown("""
+<style>
+[data-testid="stAppViewContainer"] { background:#fff; }
+.block-container {
+  max-width: 720px;
+  margin-left: auto;
+  margin-right: auto;
+  border:4px solid #15b15b;
+  border-radius:20px;
+  padding:12px 14px !important;
+}
+.stChatMessage { margin-top: 10px; margin-bottom: 10px; }
+.assistant-bubble {
+  background:#15b15b; color:#fff;
+  padding:.6rem .9rem; border-radius:16px;
+  display:inline-block; max-width:86%;
+  line-height: 1.7; max-width: 38rem;
+}
+.assistant-bubble p { margin: .6rem 0; }
+.hero-wrap { display:flex; justify-content:center; margin:8px 0 6px; }
+.hero-img  { width:132px; height:132px; object-fit:cover; border-radius:50%; }
+h1 { text-align:center !important; font-weight:800; margin:.4rem 0 .6rem; }
+[data-testid="stCaptionContainer"] { margin-top: .1rem; margin-bottom: .8rem; }
+@media (max-width: 480px) {
+  .hero-img { width:112px; height:112px; }
+  h1 { font-size:22px !important; line-height:1.2; white-space:nowrap; }
+  .assistant-bubble { max-width: 32rem; }
+}
+@media (min-width: 481px) {
+  h1 { font-size:36px !important; line-height:1.2; }
+}
+footer { margin-bottom: 12px; }
+</style>
+""", unsafe_allow_html=True)
 
-    # ✅ similarity + 手動しきい値
-    def _get_docs(q: str) -> List[Document]:
-        _fetch = max(fetch_k or 0, k * 4, 20)
-        pairs = vs.similarity_search_with_relevance_scores(q, k=_fetch, **filter_kw)
-        kept = [d for (d, s) in pairs if s is not None and s >= score_threshold]
-        if len(kept) < k:
-            for d, s in pairs:
-                if d not in kept:
-                    kept.append(d)
-                if len(kept) >= k:
-                    break
-        return kept[:k]
+# ===== 画面ヘッダー（タイトル先に描画） =====
+st.title("ココさんのお悩み相談室")
+st.caption("なんでも相談してね。ルータでカテゴリ分岐 & RAG つき。")
 
-    class _ManualThresholdRetriever:
-        def get_relevant_documents(self, q: str):
-            return _get_docs(q)
-        def invoke(self, q: str):
-            return _get_docs(q)
+# ===== 遅延インポートの結果をここで検査（白画面回避） =====
+if not imports["ok"]:
+    st.error(f"モジュールの読み込みでエラー: {type(imports['err']).__name__}: {imports['err']}")
+    with st.expander("スタックトレース（クリックで開く）", expanded=False):
+        st.code(imports["tb"])
+    st.stop()
 
-    return _ManualThresholdRetriever()
+# 以降は安全に参照
+init_router_components = imports["init_router_components"]
+route_answer = imports["route_answer"]
+reset_session_history = imports["reset_session_history"]
+make_web_chain = imports["make_web_chain"]
 
-# --------------------------------------------------
-# 3) Router→Retriever 連携の薄いヘルパ
-# --------------------------------------------------
-def build_router_aware_retriever(
-    route_category: Optional[str],
-    persist_dir: str = VECTOR_PERSIST_DIR,
-    collection: str = VECTOR_COLLECTION,
-    embedding_model: str = EMBED_MODEL,
-    k: int = 5,
-    fetch_k: int = 20,
-    use_mmr: bool = True,
-    score_threshold: Optional[float] = None,
-):
-    """
-    Router 決定（例: 'health', 'money', 'career', ...）をそのままメタフィルタに橋渡し。
-    route_category が None/空ならフィルタ無しで広く検索。
-    """
-    filter_cat = route_category
-    return init_retriever(
-        persist_dir=persist_dir,
-        collection=collection,
-        embedding_model=embedding_model,
-        k=k,
-        fetch_k=fetch_k,
-        use_mmr=use_mmr,
-        score_threshold=score_threshold,
-        filter_category=filter_cat,
-    )
+# ===== Chroma 診断 =====
+with st.sidebar.expander("🔍 Chroma診断", expanded=False):
+    import traceback
+    persist_dir = os.getenv("VECTOR_PERSIST_DIR", "data/chroma")
+    collection  = os.getenv("VECTOR_COLLECTION", "kokosan")
+    st.caption(f"dir: `{persist_dir}` / collection: `{collection}`")
+    try:
+        client = get_client(persist_dir)
+        coll = client.get_or_create_collection(collection)
+        cnt = coll.count()
+        st.success(f"✅ Collection: {coll.name}")
+        st.write("📄 Docs:", cnt)
+    except Exception as e:
+        st.error(f"❌ {type(e).__name__}: {e}")
+        st.code("".join(traceback.format_exc()), language="text")
 
-# ------------------------------------------
-# 4) Runnable 化（router_utils から利用）
-# ------------------------------------------
-def make_retrieve_runnable(retriever):
-    """router_utils から .invoke(question) で使えるようにする薄いラッパ。"""
-    return RunnableLambda(lambda q: retriever.get_relevant_documents(q))
+    with st.expander("詳細診断（コレクション一覧/メタ）", expanded=False):
+        try:
+            client = get_client(persist_dir)
+            cols = client.list_collections()
+            st.write("collections:", [c.name for c in cols])
+            try:
+                coll = client.get_or_create_collection(collection)
+                got = coll.get(include=["metadatas"], limit=3)
+                st.write("sample metadatas:", got.get("metadatas", []) )
+            except Exception as e2:
+                st.warning(f"meta read error: {e2}")
+                st.code("".join(traceback.format_exc()), language="text")
+        except Exception as e0:
+            st.warning(f"list_collections error: {e0}")
 
-# ------------------------------------------------
-# 5) 参考表示フォーマッタ（UI側“折りたたみ”に載せやすい表記）
-# ------------------------------------------------
-def format_reference(md: Dict[str, Any]) -> str:
-    """
-    UI の参考欄で使う統一フォーマット: 「タイトル（p.X） – source」
-    """
-    title = md.get("title") or ""
-    page = md.get("page")
-    page_s = f"（p.{page}）" if page is not None else ""
-    src = md.get("source") or ""
-    return f"{title}{page_s} – {src}".strip(" –")
-
-# ----------------------------------------------
-# 6) 単発クエリ用のユーティリティ
-# ----------------------------------------------
-def retrieve_texts(
-    query: str,
-    persist_dir: str = VECTOR_PERSIST_DIR,
-    collection: str = VECTOR_COLLECTION,
-    embedding_model: str = EMBED_MODEL,
-    k: int = 5,
-    fetch_k: int = 20,
-    use_mmr: bool = True,
-    score_threshold: Optional[float] = 0.35,
-    filter_category: Optional[str] = None,
-) -> List[Document]:
-    retriever = init_retriever(
-        persist_dir=persist_dir,
-        collection=collection,
-        embedding_model=embedding_model,
-        k=k,
-        fetch_k=fetch_k,
-        use_mmr=use_mmr,
-        score_threshold=score_threshold,
-        filter_category=filter_category,
-    )
-    return retriever.invoke(query)
-
-# ---------------------------------------------------
-# 7) 診断: 複数クエリでの当たり具合を可視化
-# ---------------------------------------------------
-def probe_retriever(
-    queries: Optional[List[str]] = None,
-    persist_dir: str = VECTOR_PERSIST_DIR,
-    collection: str = VECTOR_COLLECTION,
-    embedding_model: str = EMBED_MODEL,
-    k: int = 5,
-    fetch_k: int = 20,
-    use_mmr: bool = True,
-    score_threshold: Optional[float] = 0.35,
-    filter_category: Optional[str] = None,
-) -> List[Tuple[str, int, str]]:
-    """
-    1問ごとのヒット件数と先頭スニペットを返す簡易診断。
-    """
-    if queries is None:
-        queries = [
-            "ベータ版のリリース日は？",
-            "会話ログはどこに保存されてどの形式？",
-            "UI のタイトルは？",
+# ===== ingest（Cloudボタン） =====
+with st.sidebar:
+    if st.button("🔧 Cloudで初回セットアップ（ingest）"):
+        cmd = [
+            sys.executable, "ingest.py",
+            "--source_dir", "docs",
+            "--include_text", "--include_pdf",
+            "--infer_category",
+            "--persist_dir", config.VECTOR_PERSIST_DIR,
+            "--collection",  config.VECTOR_COLLECTION,
         ]
-    results: List[Tuple[str, int, str]] = []
-
-    retriever = init_retriever(
-        persist_dir=persist_dir,
-        collection=collection,
-        embedding_model=embedding_model,
-        k=k,
-        fetch_k=fetch_k,
-        use_mmr=use_mmr,
-        score_threshold=score_threshold,
-        filter_category=filter_category,
-    )
-
-    for q in queries:
         try:
-            docs = retriever.invoke(q)
-            head = docs[0].page_content[:120] if docs else ""
-            results.append((q, len(docs), head))
+            with st.spinner("ベクトルDBを作成中…"):
+                result = subprocess.run(
+                    cmd, check=True, capture_output=True, text=True, cwd=os.getcwd()
+                )
+                logger.info("[INGEST][STDOUT]\n%s", result.stdout)
+                if result.stderr:
+                    logger.info("[INGEST][STDERR]\n%s", result.stderr)
+            # ingest直後の再初期化（ロック/未反映対策）
+            time.sleep(0.5)
+            try:
+                client = get_client(config.VECTOR_PERSIST_DIR)
+                coll = client.get_or_create_collection(config.VECTOR_COLLECTION)
+                _ = coll.count()
+                st.success("ingest 完了 & 再初期化OK。再読み込みします。")
+                st.rerun()
+            except Exception as e:
+                st.error(f"ingest後の再初期化エラー: {type(e).__name__}: {e}")
+                st.code("".join(traceback.format_exc()), language="text")
+        except subprocess.CalledProcessError as e:
+            st.error(f"ingestでエラー: {e.returncode}")
+            logger.exception("[INGEST][ERROR] %s", e.stderr or e.stdout)
+
+# ===== クリーン再構築 =====
+with st.sidebar.expander("🧹 クリーン再構築", expanded=False):
+    persist_dir = os.getenv("VECTOR_PERSIST_DIR", "data/chroma")
+    if st.button("既存DBを削除して再ingest"):
+        import shutil
+        try:
+            shutil.rmtree(persist_dir, ignore_errors=True)
+            st.info("既存DBを削除しました。続けて ingest を実行してください。")
         except Exception as e:
-            results.append((q, -1, f"ERROR: {e!r}"))
-    return results
+            st.error(f"削除でエラー: {e}")
+            st.code("".join(traceback.format_exc()), language="text")
 
-# -----------------------------------------------
-# 8) コレクション診断系（共有Clientで統一）
-# -----------------------------------------------
-def diag_categories(
-    persist_dir: str,
-    collection: str,
-    sample: int = 200
-) -> Dict[str, int]:
-    """
-    コレクション内ドキュメントの metadata['category'] 分布をざっくり確認。
-    例: {'health': 123, 'money': 45, None: 67}
-    """
-    client = get_client(persist_dir)
-    coll = client.get_collection(collection)
-    got = coll.get(include=["metadatas"], limit=sample)
-    cats = [(m or {}).get("category", None) for m in (got.get("metadatas") or [])]
-    return dict(Counter(cats))
+# ===== 画像ユーティリティ =====
+@st.cache_data(show_spinner=False)
+def load_image(path: str) -> Image.Image:
+    return Image.open(path).convert("RGBA")
 
-def diag_list_collections(
-    persist_dir: str = VECTOR_PERSIST_DIR,
-) -> List[Tuple[str, int]]:
-    client = get_client(persist_dir)
-    items: List[Tuple[str, int]] = []
-    for coll in client.list_collections():
-        try:
-            count = coll.count()
-        except Exception:
-            count = -1
-        items.append((coll.name, count))
-    return items
+def to_b64(img: Image.Image) -> str:
+    buf = io.BytesIO(); img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
 
-def diag_filetypes(persist_dir: str, collection: str, sample: int = 500):
-    cl = get_client(persist_dir).get_collection(collection)
-    got = cl.get(include=["metadatas"], limit=sample)
+AVATAR_PATH = os.path.join("assets", "coco_264.png")
 
-    fts = [(m or {}).get("filetype", None) for m in (got.get("metadatas") or [])]
+# ===== セッション初期化 =====
+ss = st.session_state
+if "router_bundle" not in ss:
+    ss.router_bundle = init_router_components()
+if "messages" not in ss:
+    ss.messages = []
+if "debug" not in ss:
+    ss.debug = False
+if "session_id" not in ss:
+    ss.session_id = str(uuid4())
+router, dest_chains, default_chain, retriever = ss.router_bundle
 
-    srcs = []
-    for m in (got.get("metadatas") or []):
-        src = (m or {}).get("source", "")
-        if src:
-            srcs.append(Path(src).stem)
+# ===== アバター（任意） =====
+if os.path.exists(AVATAR_PATH):
+    try:
+        img_b64 = to_b64(load_image(AVATAR_PATH))
+        st.markdown(
+            f"""<div class="hero-wrap">
+                   <img class="hero-img" src="data:image/png;base64,{img_b64}" alt="bot avatar"/>
+                </div>""",
+            unsafe_allow_html=True
+        )
+    except Exception:
+        pass  # 画像が壊れていてもUIは落とさない
 
-    return {
-        "filetype": dict(Counter(fts)),
-        "top_sources": dict(Counter(srcs).most_common(10))
-    }
+# ===== 操作ヘッダー =====
+left, right = st.columns([1,1])
+with left:
+    if st.button("会話をクリア", use_container_width=True):
+        ss.messages.clear(); ss.pop("last_meta", None)
+        reset_session_history(ss.session_id)
+        ss.router_bundle = init_router_components()
+        ss.session_id = str(uuid4())
+        st.rerun()
+with right:
+    ss.debug = st.toggle("デバッグ表示", value=ss.debug)
 
-def assert_collection_exists(persist_dir: str, collection: str):
-    names = [c.name for c in get_client(persist_dir).list_collections()]
-    if collection not in names:
-        raise RuntimeError(f"Chroma collection '{collection}' not found in '{persist_dir}'. Existing={names}")
+# ===== 入力エリア =====
+if "is_sending" not in ss:
+    ss.is_sending = False
 
-# （安全な最小スタブ：他所から参照されてもエラーにならないよう定義）
-def _search(query: str, category: Optional[str]) -> List[Any]:
-    if category == CATEGORY_CHAT_ONLY:
-        return []
-    retr = init_retriever()
-    return retr.invoke(query)
+if "web_chain" not in ss:
+    try:
+        ss.web_chain = make_web_chain()
+    except Exception:
+        ss.web_chain = None
+
+use_live_web = st.sidebar.toggle("リアルタイムWeb検索（カテゴリ⑦）", value=True)
+
+@catch_errors()
+def handle_user_input(user_text: str):
+    ss.is_sending = True
+    ss.messages.append({"role": "user", "content": user_text})
+    try:
+        with st.spinner("考え中…"):
+            router, dest_chains, default_chain, retriever = ss.router_bundle
+            answer = route_answer(
+                user_text, router, dest_chains, default_chain, retriever,
+                web_chain=(ss.web_chain if (use_live_web and ss.web_chain) else None),
+                web_allowed=bool(use_live_web and ss.web_chain),
+                session_id=ss.session_id
+            )
+        ss.messages.append({"role": "assistant", "content": answer})
+        ss.is_sending = False
+        return True
+    except Exception as e:
+        ss.is_sending = False
+        st.toast("エラーが発生しました", icon="⚠️")
+        raise e
+
+text = st.chat_input("なんでも相談してね", disabled=ss.is_sending)
+if text:
+    if handle_user_input(text):
+        st.rerun()
+
+# ===== メッセージ描画（参考の折りたたみ） =====
+def split_body_and_refs(text: str):
+    s = text.strip()
+    body = s
+    refs = []
+    m = re.search(r"\n+#\s*参照資料\s*\n(.+)$", s, flags=re.S)
+    if m:
+        body = s[:m.start()].rstrip()
+        refs_block = m.group(1).strip()
+        lines = [ln.strip() for ln in refs_block.splitlines() if ln.strip()]
+        refs = [ln[2:].strip() if ln.startswith("- ") else ln for ln in lines]
+    return body, refs
+
+assistant_avatar_path = AVATAR_PATH if os.path.exists(AVATAR_PATH) else None
+for msg in ss.messages:
+    role = msg["role"]
+    body, refs = split_body_and_refs(msg["content"]) if role == "assistant" else (msg["content"], [])
+    with st.chat_message(role, avatar=(assistant_avatar_path if role=="assistant" else None)):
+        if role == "assistant":
+            st.markdown(f'<div class="assistant-bubble">{body}</div>', unsafe_allow_html=True)
+            if refs:
+                with st.expander("参考（クリックで表示）", expanded=False):
+                    for i, r in enumerate(refs, 1):
+                        st.markdown(f"{i}. `{r}`")
+        else:
+            st.markdown(body)
