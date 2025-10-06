@@ -276,6 +276,9 @@ def route_answer(
             )
         elif _is_smalltalk_query(user_text):
             setattr(parsed, "need_live_web", False)
+    
+    # route_answer 内、Retrieverを作る直前に追加
+    use_mmr_env = os.getenv("RAG_USE_MMR", "false").lower() == "true"
 
     # --- RAG 実行（単一路線に統一） ---
     rag_on    = os.getenv("ENABLE_RAG", "false").lower() == "true"
@@ -292,7 +295,7 @@ def route_answer(
                 embedding_model=config.EMBED_MODEL,
                 k=int(os.getenv("RAG_K", "6")),
                 fetch_k=int(os.getenv("RAG_FETCH_K", "30")),
-                use_mmr=True,
+                use_mmr=use_mmr_env,
                 score_threshold=None,
             )
             rag_docs = retr.invoke(user_text)

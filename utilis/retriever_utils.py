@@ -1,21 +1,37 @@
-# utilis/retriever_utils.py  —— 追加/置換パッチ
-
+# utilis/retriever_utils.py — Shared PersistentClient + MMRフラグ + 安全フォールバック
 from __future__ import annotations
 from typing import List, Tuple, Optional, Dict, Any
+import os
+from collections import Counter
+from pathlib import Path
+
+from chromadb.errors import InternalError
 from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings
 from langchain_core.runnables import RunnableLambda
 from langchain_core.documents import Document
-# from utilis.llm_utils import init_llm_emb   # ← 未使用ならコメントアウト
-from chromadb import PersistentClient
-from config import VECTOR_PERSIST_DIR, VECTOR_COLLECTION, EMBED_MODEL
+
 from apisecret import get_secret
-from collections import Counter
-from pathlib import Path
-from config import CATEGORY_CHAT_ONLY  # "その他・雑談" を想定
+from config import VECTOR_PERSIST_DIR, VECTOR_COLLECTION, EMBED_MODEL, CATEGORY_CHAT_ONLY
+
+# ─────────────────────────────────────────────────────────────
+# PersistentClient共有ヘルパー（utilis/chroma_client が無くても安全に動作）
+# ─────────────────────────────────────────────────────────────
+try:
+    from utilis.chroma_client import get_client  # 推奨：共通クライアント
+except Exception:
+    _client_cache: Dict[str, Any] = {}
+    def get_client(persist_dir: Optional[str] = None):
+        from chromadb import PersistentClient
+        persist_dir = persist_dir or os.getenv("VECTOR_PERSIST_DIR", "data/chroma")
+        cli = _client_cache.get(persist_dir)
+        if cli is None:
+            cli = PersistentClient(path=persist_dir)  # Settingsは渡さない（全箇所同一）
+            _client_cache[persist_dir] = cli
+        return cli
 
 # -----------------------------
-# 1) VectorStore 初期化（既存）
+# 1) VectorStore 初期化（共有Client）
 # -----------------------------
 def init_chroma_vectorstore(
     persist_dir: str = VECTOR_PERSIST_DIR,
@@ -23,50 +39,75 @@ def init_chroma_vectorstore(
     embedding_model: str = EMBED_MODEL,
 ):
     emb = OpenAIEmbeddings(model=embedding_model, api_key=get_secret("OPENAI_API_KEY"))
+    client = get_client(persist_dir)  # ★ UI と同一インスタンスを共有
     vs = Chroma(
-        persist_directory=persist_dir,
         collection_name=collection,
         embedding_function=emb,
+        client=client,                 # ← persist_directory や client_settings は渡さない
     )
     return vs
 
 # ---------------------------------
-# 2) Retriever 初期化を拡張（置換）
+# 2) Retriever 初期化（MMR/類似度の切替 + 安全フォールバック）
 # ---------------------------------
 def init_retriever(
     persist_dir: str = VECTOR_PERSIST_DIR,
     collection: str = VECTOR_COLLECTION,
     embedding_model: str = EMBED_MODEL,
-    k: int = 5,
-    fetch_k: int = 20,
-    use_mmr: bool = False,
+    k: int = 6,
+    fetch_k: int = 40,
+    use_mmr: Optional[bool] = None,        # ← env 既定
     score_threshold: Optional[float] = None,
     filter_category: Optional[str] = None,
 ):
+    """
+    use_mmr の既定は環境変数 RAG_USE_MMR（true/false）。MMR経路で InternalError
+    （"Nothing found on disk" 等）が出たら自動で similarity にフォールバックします。
+    """
+    if use_mmr is None:
+        use_mmr = os.getenv("RAG_USE_MMR", "false").lower() == "true"
+
     vs = init_chroma_vectorstore(persist_dir, collection, embedding_model)
     filter_kw = {"filter": {"category": filter_category}} if filter_category else {}
 
-    
-    if use_mmr:
-        # ✅ MMR：fetch_k は使う。threshold は絶対に渡さない
-        return vs.as_retriever(
-            search_type="mmr",
-            search_kwargs={"k": k, "fetch_k": max(fetch_k or 0, k), **filter_kw},
-        )
-
-    if score_threshold is None:
-        # ✅ similarity：しきい値なし（k と filter だけ）
+    def _sim_retr():
         return vs.as_retriever(
             search_type="similarity",
             search_kwargs={"k": k, **filter_kw},
         )
 
-    def _get_docs(q: str) -> list[Document]:
-        # 広めに取得してからスコアで足切り（最低限の品質ライン）
+    if use_mmr:
+        mmr = vs.as_retriever(
+            search_type="mmr",
+            search_kwargs={"k": k, "fetch_k": max(fetch_k or 0, k), **filter_kw},
+        )
+
+        class _SafeMMR:
+            def invoke(self, q: str):
+                try:
+                    docs = mmr.invoke(q)
+                    # 命中0や異常時は similarity にフォールバック
+                    if not docs:
+                        return _sim_retr().invoke(q)
+                    return docs
+                except InternalError:
+                    # HNSW読み出しの "Nothing found on disk" などを回避
+                    return _sim_retr().invoke(q)
+
+            # LangChain互換
+            get_relevant_documents = invoke
+
+        return _SafeMMR()
+
+    # use_mmr=False は最初から similarity
+    if score_threshold is None:
+        return _sim_retr()
+
+    # ✅ similarity + 手動しきい値
+    def _get_docs(q: str) -> List[Document]:
         _fetch = max(fetch_k or 0, k * 4, 20)
         pairs = vs.similarity_search_with_relevance_scores(q, k=_fetch, **filter_kw)
         kept = [d for (d, s) in pairs if s is not None and s >= score_threshold]
-        # 足りなければ上位から充当して k 件に揃える
         if len(kept) < k:
             for d, s in pairs:
                 if d not in kept:
@@ -84,43 +125,42 @@ def init_retriever(
     return _ManualThresholdRetriever()
 
 # --------------------------------------------------
-# 3) Router→Retriever 連携の薄いヘルパ（新規追加）
+# 3) Router→Retriever 連携の薄いヘルパ
 # --------------------------------------------------
 def build_router_aware_retriever(
     route_category: Optional[str],
     persist_dir: str = VECTOR_PERSIST_DIR,
     collection: str = VECTOR_COLLECTION,
     embedding_model: str = EMBED_MODEL,
-    k: int = 5,
-    fetch_k: int = 20,
-    use_mmr: bool = True,
+    k: int = 6,
+    fetch_k: int = 40,
+    use_mmr: Optional[bool] = None,       # ← 追加（env既定を尊重）
     score_threshold: Optional[float] = None,
 ):
     """
     Router 決定（例: 'health', 'money', 'career', ...）をそのままメタフィルタに橋渡し。
     route_category が None/空ならフィルタ無しで広く検索。
     """
-    filter_cat = route_category
     return init_retriever(
         persist_dir=persist_dir,
         collection=collection,
         embedding_model=embedding_model,
         k=k,
         fetch_k=fetch_k,
-        use_mmr=use_mmr,
+        use_mmr=use_mmr,                   # ← そのまま渡す
         score_threshold=score_threshold,
-        filter_category=filter_cat,
+        filter_category=route_category,
     )
 
 # ------------------------------------------
-# 4) Runnable 化（既存そのまま使用OK）
+# 4) Runnable 化（router_utils から利用）
 # ------------------------------------------
 def make_retrieve_runnable(retriever):
     """router_utils から .invoke(question) で使えるようにする薄いラッパ。"""
     return RunnableLambda(lambda q: retriever.get_relevant_documents(q))
 
 # ------------------------------------------------
-# 5) 参考表示の体裁を整えるフォーマッタ（新規）
+# 5) 参考表示フォーマッタ（UI側“折りたたみ”に載せやすい表記）
 # ------------------------------------------------
 def format_reference(md: Dict[str, Any]) -> str:
     """
@@ -133,16 +173,16 @@ def format_reference(md: Dict[str, Any]) -> str:
     return f"{title}{page_s} – {src}".strip(" –")
 
 # ----------------------------------------------
-# 6) 単発クエリ用のユーティリティ（置換）
+# 6) 単発クエリ用のユーティリティ
 # ----------------------------------------------
 def retrieve_texts(
     query: str,
     persist_dir: str = VECTOR_PERSIST_DIR,
     collection: str = VECTOR_COLLECTION,
     embedding_model: str = EMBED_MODEL,
-    k: int = 5,
-    fetch_k: int = 20,
-    use_mmr: bool = True,
+    k: int = 6,
+    fetch_k: int = 40,
+    use_mmr: Optional[bool] = None,
     score_threshold: Optional[float] = 0.35,
     filter_category: Optional[str] = None,
 ) -> List[Document]:
@@ -159,16 +199,16 @@ def retrieve_texts(
     return retriever.invoke(query)
 
 # ---------------------------------------------------
-# 7) 診断: 複数クエリでの当たり具合を可視化（置換）
+# 7) 診断: 複数クエリでの当たり具合を可視化
 # ---------------------------------------------------
 def probe_retriever(
     queries: Optional[List[str]] = None,
     persist_dir: str = VECTOR_PERSIST_DIR,
     collection: str = VECTOR_COLLECTION,
     embedding_model: str = EMBED_MODEL,
-    k: int = 5,
-    fetch_k: int = 20,
-    use_mmr: bool = True,
+    k: int = 6,
+    fetch_k: int = 40,
+    use_mmr: Optional[bool] = None,
     score_threshold: Optional[float] = 0.35,
     filter_category: Optional[str] = None,
 ) -> List[Tuple[str, int, str]]:
@@ -203,6 +243,9 @@ def probe_retriever(
             results.append((q, -1, f"ERROR: {e!r}"))
     return results
 
+# -----------------------------------------------
+# 8) コレクション診断系（共有Clientで統一）
+# -----------------------------------------------
 def diag_categories(
     persist_dir: str,
     collection: str,
@@ -212,19 +255,16 @@ def diag_categories(
     コレクション内ドキュメントの metadata['category'] 分布をざっくり確認。
     例: {'health': 123, 'money': 45, None: 67}
     """
-    client = PersistentClient(path=persist_dir)
+    client = get_client(persist_dir)
     coll = client.get_collection(collection)
     got = coll.get(include=["metadatas"], limit=sample)
     cats = [(m or {}).get("category", None) for m in (got.get("metadatas") or [])]
     return dict(Counter(cats))
 
-# -----------------------------------------------
-# 8) コレクション一覧（既存、そのままでOK）
-# -----------------------------------------------
 def diag_list_collections(
     persist_dir: str = VECTOR_PERSIST_DIR,
 ) -> List[Tuple[str, int]]:
-    client = PersistentClient(path=persist_dir)
+    client = get_client(persist_dir)
     items: List[Tuple[str, int]] = []
     for coll in client.list_collections():
         try:
@@ -235,13 +275,11 @@ def diag_list_collections(
     return items
 
 def diag_filetypes(persist_dir: str, collection: str, sample: int = 500):
-    cl = PersistentClient(path=persist_dir).get_collection(collection)
+    cl = get_client(persist_dir).get_collection(collection)
     got = cl.get(include=["metadatas"], limit=sample)
 
-    # filetype カウント
     fts = [(m or {}).get("filetype", None) for m in (got.get("metadatas") or [])]
 
-    # sourceファイルのstemをざっくり集計
     srcs = []
     for m in (got.get("metadatas") or []):
         src = (m or {}).get("source", "")
@@ -254,11 +292,13 @@ def diag_filetypes(persist_dir: str, collection: str, sample: int = 500):
     }
 
 def assert_collection_exists(persist_dir: str, collection: str):
-    names = [c.name for c in PersistentClient(path=persist_dir).list_collections()]
+    names = [c.name for c in get_client(persist_dir).list_collections()]
     if collection not in names:
         raise RuntimeError(f"Chroma collection '{collection}' not found in '{persist_dir}'. Existing={names}")
 
-
+# （安全な最小スタブ：他所から参照されてもエラーにならないよう定義）
 def _search(query: str, category: Optional[str]) -> List[Any]:
     if category == CATEGORY_CHAT_ONLY:
         return []
+    retr = init_retriever()
+    return retr.invoke(query)
