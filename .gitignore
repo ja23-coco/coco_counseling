@@ -1,0 +1,13 @@
+__pycache__/
+venv/
+.venv/
+env/
+data/
+.env
+*.zip
+*.log
+*.db
+*.sqlite
+gdrive_api/
+*.jsonrequirements_full.txt
+export.cmd

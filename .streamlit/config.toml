@@ -1,0 +1,7 @@
+[theme]
+base = "light"                       # ライト固定（←ここが肝）
+primaryColor = "#15b15b"             # あなたのブランド緑
+backgroundColor = "#ffffff"          # 背景：白
+secondaryBackgroundColor = "#f8fafc" # パネル/カード系の薄いグレー
+textColor = "#0f172a"                # 文字色：濃いグレー（見出しもクッキリ）
+font = "sans serif"
