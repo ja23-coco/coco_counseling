@@ -4,7 +4,7 @@ from uuid import uuid4
 from typing import Optional, Tuple, List
 
 import streamlit as st
-st.set_page_config(page_title="ココさんのお悩み相談室", page_icon="🤖", layout="wide")
+st.set_page_config(page_title="ココさんのお悩み相談室", page_icon="🤖", layout="centered")
 logger = logging.getLogger("streamlit")
 
 # ─────────────────────────────────────────────────────────────
@@ -86,6 +86,25 @@ def _safe_imports():
 imports = _safe_imports()
 
 # ===== CSS（軽量） =====
+st.markdown("""
+<style>
+[data-testid="stAppViewContainer"] { background:#fff; }
+.block-container {
+  max-width: 720px; margin: 0 auto;
+  border:4px solid #15b15b; border-radius:20px; padding:12px 14px !important;
+}
+.stChatMessage { margin: 10px 0; }
+.assistant-bubble {
+  background:#15b15b; color:#fff; padding:.6rem .9rem; border-radius:16px;
+  display:inline-block; max-width:38rem; line-height:1.7;
+}
+.hero-wrap { display:flex; justify-content:center; margin:8px 0 6px; }
+.hero-img  { width:132px; height:132px; object-fit:cover; border-radius:50%; }
+h1 { text-align:center !important; font-weight:800; margin:.4rem 0 .6rem; }
+@media (max-width: 480px) { .hero-img { width:112px; height:112px; } h1 { font-size:22px !important; } }
+</style>
+""", unsafe_allow_html=True)
+
 st.markdown("""
 <style>
 /* タイトルの折返しとクリッピング防止 */
