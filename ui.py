@@ -1,7 +1,7 @@
 # ui.py — 白画面完全回避版（超安全起動）/ Shared PersistentClient / 参照折りたたみ
 import os, io, base64, re, sys, subprocess, logging, traceback, time
 from uuid import uuid4
-from typing import Optional
+from typing import Optional, Tuple, List
 
 import streamlit as st
 st.set_page_config(page_title="ココさんのお悩み相談室", page_icon="🤖", layout="centered")
@@ -268,15 +268,64 @@ if text:
         st.rerun()
 
 # ===== メッセージ描画（参考の折りたたみ） =====
-def split_body_and_refs(text: str):
-    s = text.strip()
-    body = s; refs = []
-    m = re.search(r"\n+#\s*参照資料\s*\n(.+)$", s, flags=re.S)
+REF_HEAD_RE = re.compile(
+    r'^\s*(?:#\s*参照資料|参考資料|参考文献|参考|References)\s*[:：]?\s*$',
+    re.MULTILINE
+)
+BULLET_RE = re.compile(r'^\s*(?:[-*・]|[0-9０-９]+\.)\s+.+$', re.MULTILINE)
+
+def split_body_and_refs(text: str) -> Tuple[str, List[str]]:
+    """
+    本文と参照を分離する。
+    1) 「# 参照資料」「参考資料」「参考」「参考文献」「References」いずれかを見出しとみなす
+    2) 見出しが無い場合、末尾の連続した箇条書きブロックを参照として抽出（ヒューリスティック）
+    3) 箇条書きの重複は除去
+    """
+    if not text:
+        return text, []
+    
+    m = REF_HEAD_RE.search(text)
+    refs: List[str] = []
+    body = text
+    
     if m:
-        body = s[:m.start()].rstrip()
-        lines = [ln.strip() for ln in m.group(1).strip().splitlines() if ln.strip()]
-        refs = [ln[2:].strip() if ln.startswith("- ") else ln for ln in lines]
-    return body, refs
+        split_idx = m.start()
+        body = text[:split_idx].rstrip()
+        refs_block = text[m.end():].strip()
+        # 見出し直下の箇条書きだけを抽出
+        bullets = BULLET_RE.findall(refs_block)
+        if bullets:
+            # findall は行全体ではないケースがあるので、行ごと抽出で再取得
+            lines = [ln.strip() for ln in refs_block.splitlines() if BULLET_RE.match(ln)]
+            refs = lines
+        else:
+            # 箇条書きでなくても行単位で格納
+            refs = [ln.strip() for ln in refs_block.splitlines() if ln.strip()]
+    else:
+        # 2) 見出しがない場合：末尾の連続した箇条書きブロックを抽出
+        # 末尾から走査して「箇条書きが連続している範囲」を切り出す
+        lines = text.rstrip().splitlines()
+        tail = []
+        for ln in reversed(lines):
+            if BULLET_RE.match(ln):
+                tail.append(ln.strip())
+                continue
+            # 箇条書きが一度でも始まった後で非箇条行に当たったら終了
+            if tail:
+                break        
+        if tail:
+            tail_block = list(reversed(tail))
+            body = text[: text.rfind("\n".join(tail_block))].rstrip()
+            refs = tail_block
+
+    seen = set()
+    uniq_refs = []
+    for r in refs:
+        if r not in seen:
+            uniq_refs.append(r)
+            seen.add(r)
+
+    return body, uniq_refs
 
 assistant_avatar_path = AVATAR_PATH if img is not None else None
 for msg in ss.messages:
