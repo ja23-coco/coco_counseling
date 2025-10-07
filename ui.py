@@ -4,7 +4,7 @@ from uuid import uuid4
 from typing import Optional, Tuple, List
 
 import streamlit as st
-st.set_page_config(page_title="ココさんのお悩み相談室", page_icon="🤖", layout="centered")
+st.set_page_config(page_title="ココさんのお悩み相談室", page_icon="🤖", layout="wide")
 logger = logging.getLogger("streamlit")
 
 # ─────────────────────────────────────────────────────────────
@@ -88,20 +88,29 @@ imports = _safe_imports()
 # ===== CSS（軽量） =====
 st.markdown("""
 <style>
-[data-testid="stAppViewContainer"] { background:#fff; }
+/* タイトルの折返しとクリッピング防止 */
+h1, .stMarkdown h1 {
+  white-space: normal !important;
+  overflow-wrap: anywhere !important;
+  word-break: break-word !important;
+  line-height: 1.25 !important;
+  margin-top: 0.75rem !important;   /* 上に余白を少し追加 */
+}
+
+/* 上端クリップ対策でメインコンテナに余白 */
 .block-container {
-  max-width: 720px; margin: 0 auto;
-  border:4px solid #15b15b; border-radius:20px; padding:12px 14px !important;
+  padding-top: 1.0rem !important;
 }
-.stChatMessage { margin: 10px 0; }
-.assistant-bubble {
-  background:#15b15b; color:#fff; padding:.6rem .9rem; border-radius:16px;
-  display:inline-block; max-width:38rem; line-height:1.7;
+
+/* カードや枠の上ボーダーが h1 に重ならないよう適度な余白 */
+header, [data-testid="stHeader"] {
+  z-index: 0 !important;
 }
-.hero-wrap { display:flex; justify-content:center; margin:8px 0 6px; }
-.hero-img  { width:132px; height:132px; object-fit:cover; border-radius:50%; }
-h1 { text-align:center !important; font-weight:800; margin:.4rem 0 .6rem; }
-@media (max-width: 480px) { .hero-img { width:112px; height:112px; } h1 { font-size:22px !important; } }
+
+/* 参照折りたたみの中身が長いときのはみ出し防止 */
+details, summary {
+  overflow-wrap: anywhere !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
