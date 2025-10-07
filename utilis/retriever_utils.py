@@ -75,6 +75,16 @@ def init_retriever(
             search_type="similarity",
             search_kwargs={"k": k, **filter_kw},
         )
+    
+    class _TaggedSimilarity:
+        def __init__(self):
+            self._inner = _sim_retr()
+            self.last_mode = "sim"
+        def invoke(self, q: str):
+            self.last_mode = "sim"
+            return self._inner.invoke(q)
+        # LangChain互換
+        get_relevant_documents = invoke
 
     if use_mmr:
         mmr = vs.as_retriever(
@@ -91,7 +101,9 @@ def init_retriever(
                         return _sim_retr().invoke(q)
                     return docs
                 except InternalError:
-                    # HNSW読み出しの "Nothing found on disk" などを回避
+                    # HNSW破損等 → similarityへフォールバック
+                    fb = _sim_retr()
+                    self.last_mode = "sim_fb"
                     return _sim_retr().invoke(q)
 
             # LangChain互換
@@ -101,7 +113,7 @@ def init_retriever(
 
     # use_mmr=False は最初から similarity
     if score_threshold is None:
-        return _sim_retr()
+        return _TaggedSimilarity
 
     # ✅ similarity + 手動しきい値
     def _get_docs(q: str) -> List[Document]:
@@ -117,6 +129,8 @@ def init_retriever(
         return kept[:k]
 
     class _ManualThresholdRetriever:
+        def __init__(self):
+            self.last_mode = "sim"
         def get_relevant_documents(self, q: str):
             return _get_docs(q)
         def invoke(self, q: str):

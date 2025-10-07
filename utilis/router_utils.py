@@ -4,7 +4,7 @@
 from __future__ import annotations
 from typing import Any, Dict, Tuple, Optional, Callable, List
 
-import os, re, logging
+import os, re, logging, time
 from pydantic import BaseModel, Field
 
 from langchain_openai import ChatOpenAI
@@ -288,48 +288,72 @@ def route_answer(
     try:
         if rag_on and ((not is_chat_only and getattr(parsed, "need_rag", False)) or force_rag):
             eff_category = None if force_rag else category_val
+
+            k_val = int(os.getenv("RAG_K", "6"))
+            fk_val = int(os.getenv("RAG_FETCH_K", "60")) 
+
+            t0 = time.time()
             retr = build_router_aware_retriever(
                 route_category=eff_category,
                 persist_dir=config.VECTOR_PERSIST_DIR,
                 collection=config.VECTOR_COLLECTION,
                 embedding_model=config.EMBED_MODEL,
-                k=int(os.getenv("RAG_K", "6")),
-                fetch_k=int(os.getenv("RAG_FETCH_K", "30")),
+                k=k_val,
+                fetch_k=fk_val,
                 use_mmr=use_mmr_env,
                 score_threshold=None,
             )
             rag_docs = retr.invoke(user_text)
+            latency_ms = int((time.time() - t0) * 1000)
+            mode = getattr(retr, "last_mode", "unknown")
             used_rag = len(rag_docs) >= int(os.getenv("RAG_AUTO_THRESHOLD", "1"))
 
             # 0件時フォールバック（カテゴリ解除）
+            fb_info = None     
             if auto_fb and not used_rag and not force_rag:
+                t1 = time.time()
                 fb_retr = build_router_aware_retriever(
                     route_category=None,
                     persist_dir=config.VECTOR_PERSIST_DIR,
                     collection=config.VECTOR_COLLECTION,
                     embedding_model=config.EMBED_MODEL,
-                    k=int(os.getenv("RAG_K", "6")),
-                    fetch_k=int(os.getenv("RAG_FETCH_K", "30")),
+                    k=k_val,
+                    fetch_k=fk_val,
                     use_mmr=True,
                     score_threshold=None,
                 )
                 fb_docs = fb_retr.invoke(user_text)
+                fb_latency_ms = int((time.time() - t1) * 1000)
+                fb_mode = getattr(fb_retr, "last_mode", "unknown")
                 if fb_docs:
                     rag_docs = fb_docs
                     used_rag = True
+                fb_info = {
+                    "fallback_used": bool(fb_docs),
+                    "fallback_docs": len(fb_docs or []),
+                    "fallback_mode": fb_mode,
+                    "fallback_latency_ms": fb_latency_ms,
+                }
 
             if used_rag:
                 context_block = "\n\n" + "\n\n".join(getattr(d, "page_content", str(d)) for d in rag_docs)
+            
+            logger.info("[RAG] %s", {
+                "category": category_val,
+                "forced": force_rag,
+                "auto_fb": auto_fb,
+                "docs": len(rag_docs),
+                "used_rag": used_rag,
+                "mode": mode,            # 'mmr' / 'sim' / 'sim_fb' / 'unknown'
+                "k": k_val,
+                "fetch_k": fk_val,
+                "latency_ms": latency_ms,
+                **({"fallback": fb_info} if fb_info is not None else {})
+            })
 
     except Exception:
         logger.exception("[RAG][ERROR]")
         rag_docs, used_rag, context_block = [], False, ""
-
-    logger.info("[RAG] %s", {
-        "docs": len(rag_docs),
-        "used_rag": used_rag,
-        "preview_meta": (getattr(rag_docs[0], "metadata", {}) if rag_docs else {})
-    })
 
     # --- 安全プリチェック ---
     safety_val = str(getattr(parsed, "safety", "ok")).lower()
